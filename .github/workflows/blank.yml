@@ -25,19 +25,14 @@ jobs:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v2
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Install terraform
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
-
-      - name: list files in repo
-        run: |
-          ls -la
-          pwd
-          echo $GITHUB_WORKSPACE
-          cat main.tf
+          wget https://releases.hashicorp.com/terraform/0.14.7/terraform_0.14.7_linux_amd64.zip
+          unzip terraform_0.14.7_linux_amd64.zip
+          chmod +x terraform
+          sudo mv terraform /bin
+          
+      - name: Terraform plan
+        run: terraform plan
+          
+      
