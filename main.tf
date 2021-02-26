@@ -50,6 +50,7 @@ resource "aws_subnet" "private-b" {
   }
 }
 
+# New subnet
 resource "aws_subnet" "private-c" {
   vpc_id     = aws_vpc.epsi-tf.id
   cidr_block = "10.0.5.0/24"
