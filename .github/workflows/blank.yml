@@ -1,110 +1,188 @@
-# This is a basic workflow to help you get started with Actions
+name: Lint and Test Charts
 
-name: CI
-
-# Controls when the action will run. 
-on:
-  # Triggers the workflow on push or pull request events but only for the main branch
+on: 
   pull_request:
-    branches: [ main ]
-
-  # Allows you to run this workflow manually from the Actions tab
+    paths:
+      - 'charts/**'
+      
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  lint-test:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v2
-
-      - name: Install Terraform
-        uses: hashicorp/setup-terraform@v1
+      - name: Checkout
+        uses: actions/checkout@v2
         with:
-          terraform_version: 0.14.7
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v1
+        with:
+          version: v3.5.0
+
+      - name: Setup python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.7
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@master
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCLOUD_SERVICE_ACCOUNT_KEY }}
+          export_default_credentials: true
+
+      - name: Set up chart-testing
+        uses: helm/chart-testing-action@v2.0.1
+
+      - name: Run chart-testing (list-changed)
+        run: |
+          changed=$(ct list-changed --config ct.yaml)
+          if [[ -n "$changed" ]]; then
+            echo "chart=$changed" >> $GITHUB_ENV
+          else
+            exit 1
+          fi
+
+#      - name: Unit tests
+#        run: |
+#          helm plugin install https://github.com/vbehar/helm3-unittest
+#          helm unittest $(ct list-changed --config ct.yaml)
+
+      - name: Bump version
+        run: |
+          helm plugin install https://github.com/mbenabda/helm-local-chart-version
+          helm local-chart-version bump -s patch -c ${{ env.chart }}
+          new_version=$(helm local-chart-version get -c ${{ env.chart }})
+          echo "new_version=$new_version" >> $GITHUB_ENV
+    
+      - name: Run chart-testing (lint)
+        id: lint
+        run: |          
+          echo 'lint<<EOF' >> $GITHUB_ENV
+          ct lint --config ct.yaml >> $GITHUB_ENV
+          echo 'EOF' >> $GITHUB_ENV
+
+      - name: JSON schema
+        id: schema
+        run: |
+          helm plugin install https://github.com/karuppiah7890/helm-schema-gen.git
+          echo 'schema<<EOF' >> $GITHUB_ENV
+          helm schema-gen ${{ env.chart }}/values.yaml | tee ${{ env.chart }}/values.schema.json >> $GITHUB_ENV
+          echo 'EOF' >> $GITHUB_ENV
+
+#      - name: Create kind cluster
+#        id: kind
+#        uses: helm/kind-action@v1.0.0
+
+      - name: Release charts
+        id: release
+        run: scripts/release.sh
       
-      - name: Terraform init
-        id: init
+      - name: Bump deployed version
+        run: |
+          sudo snap install yq --channel=v3/stable
+          yq w -i modules/k8s/kubernetes/templates/infra-template.yaml \
+          "spec.chart.version" ${{ env.new_version }}
+
+      - name: add dependencies
+        run: |
+          pip3 install -r requirements.txt
+          pip3 install -r requirements-test.txt
+          pip3 install google-cloud-pubsub
+          pip3 install jproperties
+          pip3 install appdirs click docopt pyyaml requests texttable validators ultra_rest_client google-cloud-dns google-auth
+          echo '------- install aiven provider --------------- '
+          sh ./scripts/install_aiven_provider.sh
+          echo '------- install ultradns provider --------------- '
+          curl -s https://raw.githubusercontent.com/smehboub/terraform-provider-ultradns/master/scripts/install-provider.sh | bash
+      
+      - uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: '0.12.24'
+
+      - name: 'Deploy master : generate project'
+        run: |
+          python main.py --file scripts/stack_helm.json --dirname cicd_master
+
+      - name: 'Deploy master : TF Init'
+        working-directory: ../oco_tf_proj_cicd_master/qualification
         run: terraform init
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        
-      - name: Terraform fmt
-        id: fmt
-        run: terraform fmt
-        
-      - name: Terraform validate
-        id: validate
-        run: terraform validate
-      
-      - name: Terraform plan
-        id: plan
-        run: |
-          terraform plan
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          
-      - name: Terraform apply
+
+      - name: 'Deploy master : TF Apply'
         id: apply
-        run: |
-          terraform apply -auto-approve
+        working-directory: ../oco_tf_proj_cicd_master/qualification
+        run: terraform apply --target module.kubernetes -auto-approve
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          
-      - name: Terraform destroy
-        id: destroy
+          TF_VAR_aiven_token: ${{ secrets.AIVEN_TOKEN }}
+          TF_VAR_ultradns_password: ${{ secrets.DNS_TOKEN }}
+
+      - name: Run chart-testing (install)
+        id: install
         run: |
-          terraform destroy -auto-approve
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      
-      - name: comment pull request    
+          scripts/prep-kind.sh
+          echo 'install<<EOF' >> $GITHUB_ENV
+          ct install --config ct.yaml --namespace decathlon-system >> $GITHUB_ENV
+          echo 'EOF' >> $GITHUB_ENV
+
+      - name: Changelog creation
+        id: changelog
+        uses: heinrichreimer/github-changelog-generator-action@v2.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: commit modifications
+        uses: EndBug/add-and-commit@v7.0.0
+        with:
+          author_name: github-actions
+          author_email: 41898282+github-actions[bot]@users.noreply.github.com
+          message: '[skip ci] bump ${{ env.new_version }} helm chart'
+
+      - name: Comment pull request
+        if: ${{ always() }}
         uses: actions/github-script@0.9.0
         env:
-          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
-          APPLY: "terraform\n${{ steps.apply.outputs.stdout }}"
-          DESTROY: "terraform\n${{ steps.destroy.outputs.stdout }}"
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
-            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
-            #### Terraform Validation 🤖${{ steps.validate.outputs.stdout }}
-            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
-            #### Terraform Apply 📖\`${{ steps.apply.outcome }}\`
-            #### Terraform Destroy 📖\`${{ steps.destroy.outcome }}\`
+            const output = `#### Helm Format and Style 🖌\`${{ steps.lint.outcome }}\`
+            #### New chart version ⚙️\`${{ env.new_version }}\`
+            #### JSON schema generation ⚙️\`${{ steps.schema.outcome }}\`
+            #### KIND deployment status ⚙️\`${{ steps.kind.outcome }}\`
+            #### Helm install status ⚙️\`${{ steps.install.outcome }}\`
+            #### Helm release status ⚙️\`${{ steps.release.outcome }}\`
       
-            <details><summary>Show Plan</summary>
-      
-            \`\`\`${process.env.PLAN}\`\`\`
-      
+            <details><summary>Lint report</summary>
+            \`\`\`${process.env.lint}\`\`\`
             </details>
-            
-            <details><summary>Show Apply</summary>
-      
-            \`\`\`${process.env.APPLY}\`\`\`
-      
+
+            <details><summary>JSON schema</summary>
+            \`\`\`${process.env.schema}\`\`\`
             </details>
-            
-            <details><summary>Show Destroy</summary>
-      
-            \`\`\`${process.env.DESTROY}\`\`\`
-      
+
+            <details><summary>Helm install report</summary>
+            \`\`\`${process.env.install}\`\`\`
+            </details>
+
+            <details><summary>Release</summary>
+            \`\`\`${process.env.release}\`\`\`
+            </details>
+
+            <details><summary>Changelog</summary>
+            \`\`\`${process.env.CHANGELOG}\`\`\`
             </details>
       
-            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ env.tf_actions_working_dir }}\`, Workflow: \`${{ github.workflow }}\`*`;
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`;
         
             github.issues.createComment({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: output
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
             })
+
+      - name: 'Delete release'
+        if: failure() || ${{ cancelled() }}
+        run: helm gcs rm infra-template --version ${{ env.new_version }} private
